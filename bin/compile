@@ -1,0 +1,270 @@
+#!/bin/bash
+# usage: bin/compile <build-dir> <cache-dir> <env-dir>
+
+set -eo pipefail
+
+# Go releases for Darwin beginning with 1.2rc1
+# have included more than one build, depending
+# on the specific version of Mac OS X. Try to
+# account for that, but don't try too hard.
+# This doesn't affect Heroku builds, it's only
+# for testing on Darwin systems.
+platext() {
+    case $1 in
+    go1.0*|go1.1beta*|go1.1rc*|go1.1|go1.1.*) return ;;
+    esac
+    case $(uname|tr A-Z a-z) in
+    darwin) printf %s -osx10.8 ;;
+    esac
+}
+
+# Go releases have moved to a new URL scheme
+# starting with Go version 1.2.2. Return the old
+# location for known old versions and the new
+# location otherwise.
+urlfor() {
+    ver=$1
+    file=$2
+    case $ver in
+    go1.0*|go1.1beta*|go1.1rc*|go1.1|go1.1.*|go1.2beta*|go1.2rc*|go1.2|go1.2.1)
+        echo http://go.googlecode.com/files/$file
+        ;;
+    *)
+        echo https://storage.googleapis.com/golang/$file
+        ;;
+    esac
+}
+
+mkdir -p "$1" "$2"
+build=$(cd "$1/" && pwd)
+cache=$(cd "$2/" && pwd)
+buildpack=$(cd "$(dirname $0)/.." && pwd)
+
+# CF Common
+BUILDPACK_PATH=$buildpack
+export BUILDPACK_PATH
+source $buildpack/compile-extensions/lib/common
+export PYTHONHOME=$BUILDPACK_PATH/builds/runtimes/python-2.7.6
+export PATH=$PYTHONHOME/bin:$PATH
+$BUILDPACK_PATH/compile-extensions/bin/check_stack_support
+# END CF Common
+
+arch=$(uname -m|tr A-Z a-z)
+if test $arch = x86_64
+then arch=amd64
+fi
+plat=$(uname|tr A-Z a-z)-$arch
+
+# Python
+venv=$cache/venv
+mkdir -p $cache/pip
+
+python=python2.7
+PATH=$buildpack/$plat/bin:$venv/bin:$PATH
+steptxt="----->"
+
+virtualenv() {
+    python "$buildpack/vendor/virtualenv-1.11.6/virtualenv.py" "$@"
+}
+
+warn() {
+    echo >&2 " !     $@"
+}
+
+step() {
+    echo "$steptxt $@"
+}
+
+start() {
+    echo -n "$steptxt $@... "
+}
+
+finished() {
+    echo "done"
+}
+
+install_dependencies() {
+	  apt-get update
+    apt-get install libpcap-dev
+}
+
+if test -f $build/Godeps
+then
+    warn "Deprecated, old ./Godeps file found!"
+    warn "Please upgrade godeps (go get -u github.com/tools/godep) and"
+    warn "re-save your dependencies: godep save -r ./..."
+    name=$(<$build/Godeps jq -r .ImportPath)
+    ver=$(<$build/Godeps jq -r .GoVersion)
+elif test -f $build/Godeps/Godeps.json
+then
+    step "Checking Godeps/Godeps.json file."
+    if ! jq -r . < $build/Godeps/Godeps.json > /dev/null
+    then
+        warn "Bad Godeps/Godeps.json file"
+        exit 1
+    fi
+    name=$(<$build/Godeps/Godeps.json jq -r .ImportPath)
+    ver=$(<$build/Godeps/Godeps.json jq -r .GoVersion)
+elif test -f $build/.godir
+then
+    warn "Deprecated, .godir file found!"
+    warn "Please switch to godeps (github.com/tools/godep) ASAP"
+    name=$(cat $build/.godir)
+    ver=go${GOVERSION:-1.5.1}
+else
+    warn "Godeps are required. For instructions:"
+    warn "https://devcenter.heroku.com/articles/go-support"
+    exit 1
+fi
+
+file=${GOFILE:-$ver.$(uname|tr A-Z a-z)-amd64$(platext $ver).tar.gz}
+url=${GOURL:-$(urlfor $ver $file)}
+
+if test -e $build/bin && ! test -d $build/bin
+then
+    warn "File bin exists and is not a directory."
+    exit 1
+fi
+
+if is_cached
+then
+  resource_error_msg="\n-----> Resource $url is not provided by this buildpack. Please upgrade your buildpack to receive the latest resources."
+else
+  resource_error_msg="\n-----> Resource $url does not exist."
+fi
+
+if test -d $cache/$ver/go
+then
+    step "Using $ver"
+else
+    rm -rf $cache/* # be sure not to build up cruft
+    mkdir -p $cache/$ver
+    cd $cache/$ver
+    start "Installing $ver"
+        (curl `translate_dependency_url $ver` -s --fail -o - | tar xzf - 2>/dev/null)
+        if [ $? -ne 0 ]; then
+					echo "CURL RETURNED $?"
+          echo -e $resource_error_msg 1>&2
+          exit 22
+        fi
+    finished
+    echo "Downloaded [`translate_dependency_url $ver`]"
+    cd - >/dev/null
+fi
+
+step "Installing Dependencies"
+install_dependencies
+finished
+
+mkdir -p $build/bin
+GOBIN=$build/bin export GOBIN
+GOROOT=$cache/$ver/go export GOROOT
+GOPATH=$build/.heroku/go export GOPATH
+PATH=$GOROOT/bin:$PATH
+
+if ! (test -d $build/Godeps || (which hg >/dev/null && which bzr >/dev/null))
+then
+    ## Allow unset variables for virtualenv
+    set +u
+
+    echo
+    echo "       Tired of waiting for bzr and hg?"
+    echo "       Use github.com/tools/godep for faster deploys."
+    echo
+
+    start "Installing Virtualenv"
+        virtualenv --python $python --distribute --never-download --prompt='(venv) ' $venv > /dev/null 2>&1
+        . $venv/bin/activate > /dev/null 2>&1
+    finished
+
+    ## Re-disable unset variables
+    set -u
+
+    start "Installing Mercurial"
+        pip install mercurial --no-index --find-links=file://$buildpack/vendor > /dev/null 2>&1
+    finished
+
+    start "Installing Bazaar"
+        pip install bzr --no-index --find-links=file://$buildpack/vendor > /dev/null 2>&1
+    finished
+fi
+
+p=$GOPATH/src/$name
+mkdir -p $p
+cp -R $build/* $p
+
+# allow apps to specify cgo flags and set up /app symlink so things like CGO_CFLAGS=-I/app/... work
+env_dir=${3:-''}
+if [ -d $env_dir ]
+then
+    ln -sfn $build /app/code
+  for key in CGO_CFLAGS CGO_CPPFLAGS CGO_CXXFLAGS CGO_LDFLAGS GO_LINKER_SYMBOL GO_LINKER_VALUE GO15VENDOREXPERIMENT
+    do
+        if [ -f "$env_dir/$key" ]
+        then
+            export "$key=$(cat "$env_dir/$key")"
+        fi
+    done
+fi
+
+pkgs="./..."
+
+set +u
+if test "$GO15VENDOREXPERIMENT" = "1"
+then
+  case $ver in
+  go1.5*)
+      warn ""
+      warn "\$GO15VENDOREXPERIMENT=1. This is an experiment. Things may not work as expected."
+      warn "See https://devcenter.heroku.com/articles/go-support#go-1-5-vendor-experiment for more info."
+      warn ""
+      pkgs=$(<$build/Godeps/Godeps.json jq -r '.Packages | join(" ")')
+      if test ! -d "$build/vendor"
+      then
+        warn ""
+        warn "vendor/ directory does not exist."
+        warn ""
+        exit 1
+      fi
+      ;;
+  *)
+      warn "\$GO15VENDOREXPERIMENT=1 set, but unsupported on $ver"
+      exit 1
+      ;;
+  esac
+fi
+
+# If $GO_LINKER_SYMBOL and GO_LINKER_VALUE are set, tell the linker to DTRT
+FLAGS=(-tags cloudfoundry)
+if [ -n "$GO_LINKER_SYMBOL" -a -n "$GO_LINKER_VALUE" ]
+then
+  FLAGS=(${FLAGS[@]} -ldflags "-X $GO_LINKER_SYMBOL $GO_LINKER_VALUE")
+fi
+
+unset GIT_DIR # unset git dir or it will mess with goinstall
+cd $p
+if test -e $build/Godeps
+then
+    if test "$GO15VENDOREXPERIMENT" = "1"
+    then
+      step "Running: go install -v ${FLAGS[@]} $pkgs"
+      go install -v "${FLAGS[@]}" $pkgs
+    else
+      step "Running: godep go install ${FLAGS[@]} $pkgs"
+      godep go install "${FLAGS[@]}" $pkgs
+    fi
+else
+    step "Running: go get ${FLAGS[@]} $pkgs"
+    go get "${FLAGS[@]}" $pkgs
+fi
+set -u
+
+if [ $? -ne 0 ] ; then 
+	exit 1
+fi
+
+rm -rf $build/.heroku
+
+mkdir -p $build/.profile.d
+echo 'PATH=$PATH:$HOME/bin' > $build/.profile.d/go.sh
+cp $buildpack/vendor/concurrency.sh $build/.profile.d/
