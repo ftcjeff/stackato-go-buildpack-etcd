@@ -83,11 +83,6 @@ finished() {
     echo "done"
 }
 
-install_dependencies() {
-	  apt-get update
-    apt-get install libpcap-dev
-}
-
 if test -f $build/Godeps
 then
     warn "Deprecated, old ./Godeps file found!"
@@ -151,10 +146,6 @@ else
     echo "Downloaded [`translate_dependency_url $ver`]"
     cd - >/dev/null
 fi
-
-step "Installing Dependencies"
-install_dependencies
-finished
 
 mkdir -p $build/bin
 GOBIN=$build/bin export GOBIN
