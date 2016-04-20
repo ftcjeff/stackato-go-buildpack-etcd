@@ -141,7 +141,7 @@ else
     mkdir -p $cache/$ver
     cd $cache/$ver
     start "Installing $ver"
-        (curl `translate_dependency_url $ver` -o - | tar xzf - 2>/dev/null)
+        (curl `translate_dependency_url $ver` -s -o - | tar xzf - 2>/dev/null)
         if [ $? -ne 0 ]; then
 					echo "CURL RETURNED $?"
           echo -e $resource_error_msg 1>&2
